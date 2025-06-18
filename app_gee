@@ -1,0 +1,680 @@
+
+// Carregar shape piaui
+var shape_municipios = ee.FeatureCollection('users/karlosandre777/PI_Municipios_2021');
+var estado = ee.FeatureCollection('projects/ee-karlosandre777/assets/piaui_linha');
+
+var cloudPercentage = 0; // Valor padrão
+
+
+// Função para obter uma lista de todos os municípios (campo 'NM_MUN')
+function getMunicipiosList(municipiosFC) {
+  var municipiosNames = municipiosFC.reduceColumns(ee.Reducer.toList(), ['NM_MUN']).get('list');
+  return ee.List(municipiosNames).getInfo();  // Converte para uma lista acessível
+}
+
+// Função para calcular e exibir o histograma de uma banda
+function plotHistogram(image, band, municipioFC, nome) {
+  // Check if the image has any bands (not empty)
+  var hasBands = image.bandNames().size().gt(0);
+
+  var histogram = ui.Chart.image.histogram({
+    image: hasBands ? image.select(band) : ee.Image().float(), // Use empty image if no bands
+    region: municipioFC,
+    scale: 10,
+    maxPixels: 1e8
+  }).setChartType('ColumnChart')
+  .setOptions({
+    title: (hasBands ? 'Histograma de ' + nome + ' - ' + band : 'Sem dados para histograma'), // Indicate no data
+    vAxis: {title: 'Contagem de Pixels'},
+    hAxis: {title: 'Valor do Pixel'},
+    series: {0: {color: 'blue'}}
+  });
+
+  return histogram;
+}
+
+// Variável para controlar se o chartPanel já foi adicionado
+var chartPanelAdded = false;
+
+function createChart(data, classNamesMap, title) {
+  if (data) {
+    var classNames = [];
+    var classValues = [];
+
+    // Preencher arrays com nomes e valores
+    for (var key in data) {
+      if (data.hasOwnProperty(key)) {
+        var className = classNamesMap[key] || 'Classe desconhecida'; 
+        classNames.push(className);
+        classValues.push(data[key]);
+      }
+    }
+
+    // Criar gráfico com rótulos personalizados
+    return ui.Chart.array.values({
+      array: classValues,
+      axis: 0
+    })
+      .setChartType('ColumnChart')
+      .setOptions({
+        title: title,
+        hAxis: {
+          title: 'Classes',
+          textStyle: { fontSize: 6 }, 
+          titleTextStyle: { fontSize: 9 }, 
+          ticks: classNames.map(function (name, index) {
+            return { v: index, f: name }; 
+          }),
+          slantedText: true, 
+          // slantedTextAngle: 45
+        },
+        vAxis: { title: 'Contagem de Pixels' },
+        legend: { position: 'none' },
+        colors: ['#1f77b4']
+      });
+  } else {
+    print('Nenhum dado disponível para o histograma.');
+    return null; 
+  }
+}
+
+// Função para calcular a diferença NDVI e categorizar mudanças
+function calculateChangeHistogram(diferencaNDVI, feicaoFiltrada, title) {
+  // Classificar a diferença do NDVI em categorias
+  var categories = diferencaNDVI
+    .where(diferencaNDVI.lt(-0.2), 0) // Desmatamento significativo
+    .where(diferencaNDVI.gte(-0.2).and(diferencaNDVI.lte(0.2)), 1) // Sem alteração significativa
+    .where(diferencaNDVI.gt(0.2), 2); // Reflorestamento
+
+  // Reduzir as regiões para obter o histograma
+  var histogram = categories.reduceRegion({
+    reducer: ee.Reducer.frequencyHistogram(),
+    geometry: feicaoFiltrada.geometry(),
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  // Avaliar o histograma para gerar o gráfico
+  histogram.get('NDVI').evaluate(function (histogramDict) {
+    // Nomes das classes (ordem fixa)
+    var classNames = ['Desmatamento', 'Sem Alteração', 'Reflorestamento'];
+    var classValues = [0, 0, 0]; // Inicializa os valores com 0
+
+    // Preenche os valores com base no histograma
+    if (histogramDict) {
+      for (var key in histogramDict) {
+        if (histogramDict.hasOwnProperty(key)) {
+          var index = parseInt(key); // Converte a chave para número
+          if (index >= 0 && index < classValues.length) {
+            classValues[index] = histogramDict[key];
+          }
+        }
+      }
+    }
+
+    // Configurar o gráfico
+    var chart = ui.Chart.array.values({
+      array: classValues,
+      axis: 0
+    })
+      .setChartType('ColumnChart')
+      .setOptions({
+        title: title,
+        hAxis: {
+          title: 'Classes',
+          textStyle: { fontSize: 7 },
+          titleTextStyle: { fontSize: 10 },
+          ticks: classNames.map(function (name, index) {
+            return { v: index, f: name };
+          }),
+          slantedText: true
+        },
+        vAxis: {
+          title: 'Contagem de Pixels',
+          textStyle: { fontSize: 7 },
+          titleTextStyle: { fontSize: 10 }
+        },
+        legend: { position: 'none' },
+        colors: ['#1f77b4'], 
+        annotations: {
+          alwaysOutside: true,
+          textStyle: {
+            fontSize: 9,
+            color: '#000'
+          }
+        }
+      });
+
+    // Adicionar o gráfico ao painel
+    if (chart) {
+      chartPanel1.widgets().add(chart);
+    }
+  });
+}
+
+
+
+
+// Função para carregar e visualizar a coleção de imagens Sentinel-2
+function updateMap(startDate1, endDate1, startDate2, endDate2, municipio, zoom,cloudPercentage) {
+  chartPanel.clear();
+  
+  var imagem1 = ee.ImageCollection('COPERNICUS/S2')
+  .select(['B2', 'B3', 'B4', 'B8'])
+  .filterDate(startDate1, endDate1)
+  .sort('CLOUDY_PIXEL_PERCENTAGE')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloudPercentage));
+
+  var imagem2 = ee.ImageCollection('COPERNICUS/S2')
+    .select(['B2', 'B3', 'B4', 'B8'])
+    .filterDate(startDate2, endDate2)
+    .sort('CLOUDY_PIXEL_PERCENTAGE')
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloudPercentage));
+  
+    
+  // verificar quantas imagens utilizadas no dataset filtrado
+  var count1 = ee.Number(imagem1.size());
+  var count2 = ee.Number(imagem2.size());
+
+  var imagem1Median = ee.Algorithms.If(count1.gt(0), imagem1.median(), ee.Image().float());
+  var imagem2Median = ee.Algorithms.If(count2.gt(0), imagem2.median(), ee.Image().float());
+
+  var image1 = ee.Image(imagem1Median).select(['B2', 'B3', 'B4', 'B8'], ['B2', 'B3', 'B4', 'B8']).multiply(0.0001);
+  var image2 = ee.Image(imagem2Median).select(['B2', 'B3', 'B4', 'B8'], ['B2', 'B3', 'B4', 'B8']).multiply(0.0001);
+
+  var feicaoFiltrada = shape_municipios.filter(ee.Filter.eq('NM_MUN', municipio));
+
+  var clippedImage1 = image1.clip(feicaoFiltrada);
+  var clippedImage2 = image2.clip(feicaoFiltrada);
+  
+  var stats1 = image1.select(['B4', 'B8']).reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  }),
+  geometry: feicaoFiltrada.geometry(),
+  scale: 10,  
+  maxPixels: 1e13
+  });
+  
+  var stats2 = image2.select(['B4', 'B8']).reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  }),
+  geometry: feicaoFiltrada.geometry(),
+  scale: 10,  
+  maxPixels: 1e13
+  });
+  
+  // Atribuir valores a variáveis para o ano recente, garantindo valores padrão para null
+  var media_B4_1 = ee.Number(ee.Algorithms.If(stats1.get('B4_mean'), stats1.get('B4_mean'), 0));
+  var sigma_B4_1 = ee.Number(ee.Algorithms.If(stats1.get('B4_stdDev'), stats1.get('B4_stdDev'), 0));
+  var media_B8_1 = ee.Number(ee.Algorithms.If(stats1.get('B8_mean'), stats1.get('B8_mean'), 0));
+  var sigma_B8_1 = ee.Number(ee.Algorithms.If(stats1.get('B8_stdDev'), stats1.get('B8_stdDev'), 0));
+  
+  // Atribuir valores a variáveis para o ano antigo, garantindo valores padrão para null
+  var media_B4_2 = ee.Number(ee.Algorithms.If(stats2.get('B4_mean'), stats2.get('B4_mean'), 0));
+  var sigma_B4_2 = ee.Number(ee.Algorithms.If(stats2.get('B4_stdDev'), stats2.get('B4_stdDev'), 0));
+  var media_B8_2 = ee.Number(ee.Algorithms.If(stats2.get('B8_mean'), stats2.get('B8_mean'), 0));
+  var sigma_B8_2 = ee.Number(ee.Algorithms.If(stats2.get('B8_stdDev'), stats2.get('B8_stdDev'), 0));
+  
+  // Cálculo do ganho e offset para a banda 4
+  var ganho_B4 = ee.Algorithms.If(sigma_B4_2.gt(0), sigma_B4_1.pow(2).divide(sigma_B4_2.pow(2)).pow(0.5), 1); 
+  var offset_B4 = media_B4_1.subtract(ee.Number(ganho_B4).multiply(media_B4_2));
+  
+  // Cálculo do ganho e offset para a banda 8
+  var ganho_B8 = ee.Algorithms.If(sigma_B8_2.gt(0), sigma_B8_1.pow(2).divide(sigma_B8_2.pow(2)).pow(0.5), 1);
+  var offset_B8 = media_B8_1.subtract(ee.Number(ganho_B8).multiply(media_B8_2));
+  
+  // Função para aplicar ganho e offset na banda
+  function applyRadiometricNormalization(image, band, ganho, offset) {
+    var ganhoImage = ee.Image.constant(ganho);
+    var offsetImage = ee.Image.constant(offset);
+    
+    return image.select(band).multiply(ganhoImage).add(offsetImage);
+  }
+    
+  // Aplicando nas bandas 4 e 5 da imagem 
+  var image_B4_normalized = applyRadiometricNormalization(clippedImage2, 'B4', ganho_B4, offset_B4);
+  var image_B8_normalized = applyRadiometricNormalization(clippedImage2, 'B8', ganho_B8, offset_B8);
+  
+  // Juntar as bandas normalizadas B4 e B5
+  var image_normalized = image_B4_normalized.addBands(image_B8_normalized);
+  
+  var ndvi1 = clippedImage1.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndvi2 = clippedImage2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  
+  // Antes de chamar plotHistogram(), verifique se as imagens possuem bandas:
+  var image1HasBands = clippedImage1.bandNames().size().gt(0);
+  var image2HasBands = clippedImage2.bandNames().size().gt(0);
+  
+  var histogramndvi1 = plotHistogram(image1HasBands ? ndvi1 : ee.Image().float(), 'NDVI', feicaoFiltrada,'ndvi1'); // 
+  
+
+  // classificação 7 classes
+  var classified1 = ndvi1
+    .where(ndvi1.lt(0.07), 0)                    // Água
+    .where(ndvi1.gte(0.07).and(ndvi1.lt(0.25)), 1)  // Área urbana
+    .where(ndvi1.gte(0.25).and(ndvi1.lt(0.35)), 2)  // Solo exposto
+    .where(ndvi1.gte(0.35).and(ndvi1.lt(0.46)), 3)  // Vegetação rala
+    .where(ndvi1.gte(0.46).and(ndvi1.lt(0.54)), 4)  // Vegetação aberta
+    .where(ndvi1.gte(0.54).and(ndvi1.lt(0.63)), 5)  // Vegetação em transição
+    .where(ndvi1.gte(0.63), 6);                   // Vegetação muito densa 
+    
+  var classified2 = ndvi1
+    .where(ndvi2.lt(0.07), 0)                    // Água
+    .where(ndvi2.gte(0.07).and(ndvi2.lt(0.25)), 1)  // Área urbana
+    .where(ndvi2.gte(0.25).and(ndvi2.lt(0.35)), 2)  // Solo exposto
+    .where(ndvi2.gte(0.35).and(ndvi2.lt(0.46)), 3)  // Vegetação rala
+    .where(ndvi2.gte(0.46).and(ndvi2.lt(0.54)), 4)  // Vegetação aberta
+    .where(ndvi2.gte(0.54).and(ndvi2.lt(0.63)), 5)  // Vegetação em transição
+    .where(ndvi2.gte(0.63), 6);              // Vegetação muito densa
+
+  var diferencaNDVI = ndvi2.subtract(ndvi1);
+  
+
+  var RGB_visParams = {
+    bands: ['B4', 'B3', 'B2'],  // Vermelho, Verde, Azul (RGB)
+    min: 0.0322,
+    max: 0.6345,
+  };
+  
+  startDate2 = startDate2.toISOString().split('T')[0];
+  startDate1 = startDate1.toISOString().split('T')[0];
+  
+  
+  // Define a paleta de cores como uma variável
+  var ndviPalette = ['#e5372b', // Água
+                     '#f59053', // Área urbana
+                     '#7dc981', // solo
+                     '#77c35c', // Vegetação aberta
+                     '#1a9641', // Vegetação em transição  1a9641
+                     '#2a5c39']; // Vegetação muito densa
+
+  // Limpa as camadas atuais no mapa
+  map.layers().reset();
+  if (zoom >8){
+    map.addLayer(clippedImage1, RGB_visParams, 'Sentinel2 - '+startDate1.substring(0,7));
+    map.addLayer(clippedImage2, RGB_visParams, 'Sentinel2 - '+startDate2.substring(0,7));
+    map.addLayer(diferencaNDVI, {min: -1, max: 1, palette: ['red', 'white', 'blue']}, 'Diferença');
+    
+    map.addLayer(classified1, {
+      min: 0,
+      max: 6,
+      palette: ndviPalette
+    },  'ndvi - '+ startDate1.substring(0,7));
+    
+    map.addLayer(classified2, {
+      min: 0,
+      max: 6,
+      palette:  ndviPalette
+    }, 'ndvi - '+ startDate2.substring(0,7));
+
+
+  }
+  map.addLayer(estado, {color: '0000FF', fillColor: 0, width: 2}, 'Piaui');
+  
+  map.centerObject(feicaoFiltrada, zoom);
+  var clippedImagergb1 = clippedImage1.select(['B4', 'B3', 'B2']);
+  var clippedImagergb2 = clippedImage2.select(['B4', 'B3', 'B2']);
+  
+  // Função para gerar e adicionar o botão de download ao painel dos gráficos
+  function generateDownloadButton(image, fileName, label) {
+      image.getDownloadURL({
+          format: 'GeoTIFF',
+          scale: 20,
+          region: feicaoFiltrada.geometry(),
+          maxPixels: 1e9,
+          filePerBand: false
+      }, function(url, error) {
+          if (error) {
+                  print('Erro ao gerar o download:', error);
+          } else if (url) {
+          var downloadLabel = ui.Label({
+              value: label,
+              style: {
+                color: 'green',
+                backgroundColor:'#DCDCDC',
+                width: '95%',
+                textAlign:'center',
+                padding:'5px',
+                fontSize: '12px',
+              },
+              targetUrl: url
+          });
+          chartPanel2.widgets().add(downloadLabel);
+          }
+      });
+  }
+  
+  
+  generateDownloadButton(ndvi1.toFloat(), 'NDVI_' + startDate1.substring(0, 7), 'Download NDVI_' + startDate1.substring(0, 7));
+  generateDownloadButton(ndvi2.toFloat(), 'NDVI_' + startDate2.substring(0, 7), 'Download NDVI_' + startDate2.substring(0, 7));
+  generateDownloadButton(clippedImagergb1.toFloat(), 'NDVI_' + startDate1.substring(0, 7), 'Baixar Imagem_' + startDate1.substring(0, 7));
+  generateDownloadButton(clippedImagergb2.toFloat(), 'NDVI_' + startDate2.substring(0, 7), 'Baixar Imagem_' + startDate2.substring(0, 7));
+
+  generateDownloadButton(diferencaNDVI.toFloat(), 'DiffNDVI_' + startDate1.substring(0, 7), 'Download Diferença NDVI');
+
+  var classNamesMap = {
+    '0.0': 'Água',
+    '1.0': 'Área urbana',
+    '2.0': 'Solo exposto',
+    '3.0': 'Vegetação em transição',  
+    '4.0': 'Vegetação',
+    '5.0': 'Vegetação muito densa',
+    
+  };
+
+
+  // Reduzir regiões para obter histogramas
+  var histogram1 = classified1.reduceRegion({
+    reducer: ee.Reducer.frequencyHistogram(),
+    geometry: feicaoFiltrada.geometry(),
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  var histogram2 = classified2.reduceRegion({
+    reducer: ee.Reducer.frequencyHistogram(),
+    geometry: feicaoFiltrada.geometry(),
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  histogram1.get('NDVI').evaluate(function(histogramDict1) {
+    if (histogramDict1) {
+      var chart1 = createChart(histogramDict1, classNamesMap, 'Distribuição de Classes NDVI - ' + startDate1.substring(0, 7));
+      if (chart1) {
+        chartPanel1.widgets().add(chart1);
+      }
+    } else {
+      print('Nenhum dado disponível para o histograma 1.');
+    }
+  });
+  
+  histogram2.get('NDVI').evaluate(function(histogramDict2) {
+    if (histogramDict2) {
+      var chart2 = createChart(histogramDict2, classNamesMap, 'Distribuição de Classes NDVI - ' + startDate2.substring(0, 7));
+      if (chart2) {
+        chartPanel1.widgets().add(chart2);
+      }
+    } else {
+      print('Nenhum dado disponível para o histograma 2.');
+    }
+    
+  });
+  
+  calculateChangeHistogram(diferencaNDVI, feicaoFiltrada, 'Mudanças no NDVI - ' + startDate1.substring(0, 7) + ' a ' + startDate2.substring(0, 7));
+  
+  chartPanel.add(chartPanel1);
+  chartPanel.add(chartPanel2);
+  
+  
+  
+  function exportImages (image,classified,ndvi,Date) {
+    Export.image.toDrive({
+      image: image.toFloat(),
+      description:  'imagem-'+ Date.substring(0,7),
+      folder: 'GEE_export',
+      region: feicaoFiltrada,
+      fileNamePrefix: 'imagem-'+ Date.substring(0,7),
+      scale: 10, // Especificar a resolução desejada em metros
+      fileFormat: 'GeoTIFF'
+    });
+    
+    Export.image.toDrive({
+      image: classified.toFloat(),
+      description:  'classific-'+ Date.substring(0,7),
+      folder: 'GEE_export',
+      region: feicaoFiltrada,
+      fileNamePrefix: 'classific-'+ Date.substring(0,7),
+      scale: 10, // Especificar a resolução desejada em metros
+      fileFormat: 'GeoTIFF'
+    });
+    
+    Export.image.toDrive({
+      image: ndvi.toFloat(),
+      description:  'ndvi-'+ Date.substring(0,7),
+      folder: 'GEE_export',
+      region: feicaoFiltrada,
+      fileNamePrefix: 'ndvi-'+ Date.substring(0,7),
+      scale: 10, // Especificar a resolução desejada em metros
+      fileFormat: 'GeoTIFF'
+    });
+  }
+
+  
+  Export.image.toDrive({
+    image: diferencaNDVI.toFloat(),
+    description:  'diferenca-'+ startDate2.substring(0,7)+'_'+ startDate1.substring(0,7),
+    folder: 'GEE_export',
+    fileNamePrefix: 'diferenca-'+ startDate2.substring(0,7)+'_'+ startDate1.substring(0,7),
+    scale: 10, // Especificar a resolução desejada em metros
+    region: feicaoFiltrada,
+    fileFormat: 'GeoTIFF'
+  });
+  
+  
+
+  exportImages (clippedImage1,classified1,ndvi1,startDate1)
+  exportImages (clippedImage2,classified2,ndvi2,startDate2)
+  
+  // Adiciona painel, mapa e painel do gráfico na interface
+  ui.root.add(chartPanel);
+}
+
+// Cria o mapa e centraliza na AOI
+var map = ui.Map();
+
+// Cria um painel para o gráfico abaixo do mapa
+var chartPanel = ui.Panel();
+chartPanel.style().set({
+  position: 'bottom-center',
+  width: '20%',
+  height: '100%',
+
+});
+
+var chartPanel1 = ui.Panel();
+chartPanel1.style().set({
+  width: '100%', 
+  height: 'auto',
+});
+
+
+var chartPanel2 = ui.Panel();
+chartPanel2.style().set({
+  width: '100%', 
+  height: 'auto',
+  // backgroundColor: '#1f77b4';
+});
+
+
+// Cria um painel de controle para os widgets
+var panel = ui.Panel();
+panel.style().set('width', '300px');
+
+
+// Carrega lista de municípios e cria campo de seleção
+var municipiosList = getMunicipiosList(shape_municipios);
+var municipioSelect = ui.Select({
+  items: municipiosList.sort(),
+  placeholder: 'Selecione um município',
+  onChange: function(selectedMunicipio) {
+    var startDate1 = new Date(dateSlider1.getValue()[0]);
+    var endDate1 = new Date(dateSlider1.getValue()[1]);
+    var startDate2 = new Date(dateSlider2.getValue()[0]);
+    var endDate2 = new Date(dateSlider2.getValue()[1]);
+  
+  }
+});
+
+
+// Adiciona o seletor ao painel
+panel.add(ui.Label('Selecione um Município'));
+panel.add(municipioSelect);
+
+// Define a data de início como uma constante e a data final como a data atual
+// var START_DATE = '2022-07-01';
+// var DEFAULT_VALUE = '2022-08-01';
+var END_DATE = new Date().toISOString().split('T')[0];  // Converte para o formato 'YYYY-MM-DD'
+
+
+// Cria um slider de data
+var dateSlider1 = ui.DateSlider({
+  start: '2016-02-01',  // Data inicial
+  end: END_DATE,    // Data final
+  value: '2022-12-20',  // Data inicial padrão
+  period: 30,           // Intervalo de 30 dias entre os valores do slider
+  onChange: function(value) {  // Função chamada ao mudar o valor do slider
+      var selectedMunicipio = municipioSelect.getValue(); 
+      
+      var startDate1 = new Date(dateSlider1.getValue()[0]); 
+      var endDate1 = new Date(dateSlider1.getValue()[1]); 
+      
+      var startDate2 = new Date(dateSlider2.getValue()[0]); 
+      var endDate2 = new Date(dateSlider2.getValue()[1]); 
+      print('data slider ',dateSlider1.getValue()[0])
+      print('stardate e end date: ',startDate1,endDate1)
+
+  }
+});
+
+panel.add(ui.Label('Escolha a data mais recente'));
+panel.add(dateSlider1);
+
+
+var dateSlider2 = ui.DateSlider({
+  start: '2016-02-01', 
+  end: END_DATE,  
+  value: '2023-12-20',  
+  period: 30,           
+  onChange: function(value) { 
+      var selectedMunicipio = municipioSelect.getValue(); 
+
+      var startDate2 = new Date(dateSlider2.getValue()[0]); 
+      var endDate2 = new Date(dateSlider2.getValue()[1]); 
+      
+      
+      var startDate1 = new Date(dateSlider1.getValue()[0]); 
+      var endDate1 = new Date(dateSlider1.getValue()[1]); 
+      
+  }
+});
+
+panel.add(ui.Label('Escolha a data mais antigo'));
+panel.add(dateSlider2);
+
+// Slider para controlar a porcentagem de nuvens
+var cloudSlider = ui.Slider({
+  min: 0,
+  max: 100,
+  value: 50, // Valor padrão
+  step: 1,
+  onChange: function(value) {
+    cloudPercentage = value; 
+    print('Porcentagem de nuvens ajustada para:', cloudPercentage);
+  }
+});
+
+// Adicionar o slider ao painel
+panel.add(ui.Label('Porcentagem de nuvens permitida (%)'));
+panel.add(cloudSlider);
+
+
+// Cria um slider para ajustar a opacidade da camada
+var opacitySlider = ui.Slider({
+  min: 0,
+  max: 1,
+  value: 1,
+  step: 0.01,
+  onChange: function(value) {
+    map.layers().forEach(function(layer) {
+    layer.setOpacity(value); 
+  });
+  }
+});
+panel.add(ui.Label('Opacidade da Imagem'));
+panel.add(opacitySlider);
+
+
+
+var warningLabel = null;
+
+// Cria um botão para aplicar as informa
+var resetButton = ui.Button({
+  label: 'Aplicar',
+  onClick: function() {
+    ui.root.remove(instructionPanel);
+    var selectedMunicipio = municipioSelect.getValue();
+    
+    var startDate2 = new Date(dateSlider2.getValue()[0]); 
+    var endDate2 = new Date(dateSlider2.getValue()[1]); 
+    
+    var startDate1 = new Date(dateSlider1.getValue()[0]); 
+    var endDate1 = new Date(dateSlider1.getValue()[1]);
+
+    if (!selectedMunicipio) {
+      if (!warningLabel) {
+        warningLabel = ui.Label({
+          value: 'Por favor, selecione um município antes de prosseguir.',
+          style: {color: 'red', fontWeight: 'bold'}
+        });
+        panel.add(warningLabel);
+      }
+    } else {
+      // Remove o label de aviso se um município estiver selecionado
+      if (warningLabel) {
+        panel.remove(warningLabel);
+        warningLabel = null;
+      }
+
+      var cloudPercentage = cloudSlider.getValue();
+
+      // Reinicia os painéis de gráficos e downloads antes de atualizar o mapa
+      chartPanel1.clear();
+      chartPanel2.clear();
+
+      // Atualiza o mapa com os valores selecionados
+      updateMap(startDate1, endDate1, startDate2, endDate2, selectedMunicipio, 10.5, cloudPercentage);
+    }
+  }
+});
+panel.add(resetButton);
+
+// Limpa a interface atual e adiciona o painel e o mapa
+ui.root.clear();
+ui.root.add(panel);
+ui.root.add(map);
+
+
+var instructionPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {
+    width: '400px',
+    backgroundColor: '#f8f9fa',
+    padding: '10px',
+    border: '1px solid black',
+    position:'top-left'
+  }
+});
+
+instructionPanel.add(ui.Label({
+  value: 'Instruções para Utilização',
+  style: { fontWeight: 'bold', fontSize: '14px',textAlign: 'center',  margin: '10px 0 10px 0' }
+}));
+
+instructionPanel.add(ui.Label({ value: '1. Selecione um município da lista.', style: { fontSize: '12px',margin: '10px'}}));
+instructionPanel.add(ui.Label({ value: '2. Escolha o intervalo de datas para análise recente e antiga.', style: { fontSize: '12px',margin: '10px' }}));
+instructionPanel.add(ui.Label({ value: 'Obs:\n- Imagens do Sentinel disponíveis a partir de fevereiro de 2016;\n- O codigo não escolhe uma imagem única, mas sim um conjunto de imagens capturadas dentro de um período de 30 dias a partir da data selecionada.',style: { fontSize: '11px', whiteSpace: 'pre-wrap', margin: '-10px 0px 0px 25px' }}));
+instructionPanel.add(ui.Label({ value: '3. Ajuste a porcentagem máxima de nuvens permitida no controle deslizante.', style: { fontSize: '13px',margin: '15px' }}));
+instructionPanel.add(ui.Label({ value: 'Obs:\n- Ao aumentar a porcentagem de nuvem permitida maior a possibilidade de não encontrar imagens para data selecionada',style: { fontSize: '11px', whiteSpace: 'pre-wrap', margin: '-10px 0px 0px 25px' }}));
+instructionPanel.add(ui.Label({ value: '4. Ajuste a opacidade da imagem conforme necessário(opcional).', style: { fontSize: '13px',margin: '10px' }}));
+instructionPanel.add(ui.Label({ value: '5. Clique no botão "Aplicar" para gerar os resultados.', style: { fontSize: '13px',margin: '10px' }}));
+instructionPanel.add(ui.Label({ value: '6. Os graficos e o download das imagens será gerado no painel do lado direito após o processo.', style: { fontSize: '13px',margin: '10px' }}));
+
+ui.root.widgets().insert(1, instructionPanel);
+
+map.addLayer(estado, {color: '0000FF', fillColor: 0, width: 2}, 'Piaui');
+map.centerObject(ee.Geometry.Point([-42.1287245171079, -7.008553893514321]), 6);
